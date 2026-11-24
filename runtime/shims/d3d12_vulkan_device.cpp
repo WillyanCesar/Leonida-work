@@ -1693,6 +1693,38 @@ struct ConsoleDescriptorHeapDesc {
     std::uint64_t size = 0;
 };
 
+// 64 KiB, the console's page size and the granularity the title's own placeholders use.
+constexpr std::uint64_t kConsoleHeapPage = 0x10000;
+
+// Map a pagefile-backed section over [address, address+size) at that exact address, one 64 KiB page at a time.
+// Returns the address when every page was mapped, null otherwise.
+inline void* console_heap_back(std::uint64_t address, SIZE_T size) {
+    using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG,
+                                           PMEM_EXTENDED_PARAMETER, ULONG);
+    static const auto map_view3 = [] {
+        const HMODULE kernelbase = ::GetModuleHandleW(L"kernelbase.dll");
+        return reinterpret_cast<MapViewOfFile3Fn>(
+            kernelbase ? ::GetProcAddress(kernelbase, "MapViewOfFile3") : nullptr);
+    }();
+    if (!map_view3 || size == 0) return nullptr;
+
+    const SIZE_T page = static_cast<SIZE_T>(kConsoleHeapPage);
+    for (SIZE_T done = 0; done < size; done += page) {
+        const HANDLE section = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                                    static_cast<DWORD>(page), nullptr);
+        if (!section) return nullptr;
+        void* const target = reinterpret_cast<void*>(static_cast<std::uintptr_t>(address + done));
+        const void* mapped = map_view3(section, ::GetCurrentProcess(), target, 0, page, MEM_REPLACE_PLACEHOLDER,
+                                       PAGE_READWRITE, nullptr, 0);
+        ::CloseHandle(section);
+        if (mapped != target) {
+            // The range is not a placeholder here (or is already backed); try a plain commit of that page.
+            if (!::VirtualAlloc(target, page, MEM_COMMIT, PAGE_READWRITE)) return nullptr;
+        }
+    }
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
+}
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -1711,10 +1743,19 @@ public:
           console_addressed_(console_address != 0) {
         const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
         if (console_addressed_) {
-            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
-            // now; backing this range with title memory / §3.3 aliasing is tracked separately.
-            log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
-            cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
+            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address and then writes descriptors
+            // through that handle, so the title's range has to be real memory at that address. Map exactly the
+            // descriptor bytes, rounded to the page granularity xmem's placeholders use: the title reserved this
+            // range itself, and a pagefile-backed section replaces the placeholder page by page.
+            const SIZE_T want = static_cast<SIZE_T>(
+                (std::max<VkDeviceSize>(bytes, 1) + kConsoleHeapPage - 1) & ~(kConsoleHeapPage - 1));
+            void* backing = console_heap_back(console_address_, want);
+            log_once(backing ? "descriptor heap uses console address, backed in place"
+                             : "descriptor heap uses console address, NOT backed (writes will fault)",
+                     int(desc_.Type));
+            cpu_ = reinterpret_cast<std::uint8_t*>(backing ? backing
+                                                          : reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+                                                                console_address_)));
             in_arena_ = false;
             return;
         }
