@@ -24,21 +24,24 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
-// create_console_descriptor_heap is declared in d3d12_com.h, whose Vulkan include is not on every target that
-// compiles this file. Resolve the one symbol from this module at run time and fall back to the PC method, which is
-// what a 16-byte description gets anyway.
+// create_console_descriptor_heap lives in d3d12_vulkan_device.cpp, which the GPU-free test binaries do not link.
+// That file registers its own function here at startup, so this proxy can call it directly when it is present and
+// fall back to the PC CreateDescriptorHeap when it is not. (A GetProcAddress lookup does not work: the symbol is not
+// exported from gta6rt.exe, so it silently resolved to nothing and every console-addressed heap was created without
+// its console address, which is what makes the title assert on GetCPUDescriptorHandleForHeapStart().)
 namespace rt::d3d12 {
 using CreateConsoleHeapFn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
                                             D3D12_GPU_VIRTUAL_ADDRESS, std::uint64_t, REFIID, void**);
-inline CreateConsoleHeapFn create_console_heap_fn() {
-    static const CreateConsoleHeapFn fn = [] {
-        return reinterpret_cast<CreateConsoleHeapFn>(reinterpret_cast<void*>(::GetProcAddress(
-            ::GetModuleHandleW(nullptr),
-            "?create_console_descriptor_heap@d3d12@rt@@YAJPEAUID3D12Device@@PEBUD3D12_DESCRIPTOR_HEAP_DESC@@_K2AEBU_GUID@@PEAPEAX@Z")));
-    }();
+inline CreateConsoleHeapFn& console_heap_slot() {
+    static CreateConsoleHeapFn fn = nullptr;
     return fn;
 }
 }  // namespace rt::d3d12
+
+// Called by d3d12_vulkan_device.cpp's static initializer.
+extern "C" void leonida_register_console_heap(void* fn) {
+    rt::d3d12::console_heap_slot() = reinterpret_cast<rt::d3d12::CreateConsoleHeapFn>(fn);
+}
 
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -1634,7 +1637,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
             if (address != 0) {
                 console_extended = true;
-                if (const auto fn = rt::d3d12::create_console_heap_fn()) {
+                if (const auto fn = rt::d3d12::console_heap_slot()) {
                     hr = fn(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                             __uuidof(ID3D12DescriptorHeap), &created);
                 } else {

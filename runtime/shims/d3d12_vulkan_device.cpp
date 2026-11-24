@@ -10009,6 +10009,17 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     return hand_out(heap, riid, out);
 }
 
+// Hand the console descriptor-heap entry point to the device proxy (runtime/shims/d3d12_xs_device.cpp). It cannot
+// look the symbol up by name because nothing exports it from gta6rt.exe.
+extern "C" void leonida_register_console_heap(void* fn);
+namespace {
+struct ConsoleHeapRegistration {
+    ConsoleHeapRegistration() {
+        leonida_register_console_heap(reinterpret_cast<void*>(&create_console_descriptor_heap));
+    }
+} g_console_heap_registration;
+}  // namespace
+
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
     try {
         constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
