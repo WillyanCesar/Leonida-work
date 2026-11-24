@@ -43,6 +43,20 @@ extern "C" void leonida_register_console_heap(void* fn) {
     rt::d3d12::console_heap_slot() = reinterpret_cast<rt::d3d12::CreateConsoleHeapFn>(fn);
 }
 
+// Backs a page of the title's address space in place, so a write to a console VA the title chose lands in real
+// memory. Registered by the same file that owns the mapping helper; null in builds without it.
+namespace {
+using BackRangeFn = void*(WINAPI*)(std::uint64_t, std::size_t);
+BackRangeFn& back_range_slot() {
+    static BackRangeFn fn = nullptr;
+    return fn;
+}
+}  // namespace
+
+extern "C" void leonida_register_console_back(void* fn) {
+    back_range_slot() = reinterpret_cast<BackRangeFn>(fn);
+}
+
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -1913,6 +1927,23 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 return reinterpret_cast<std::uint64_t>(self);
             }
         }
+    } else if constexpr (Slot == 70) {
+        // The title hands its own console address as the output pointer for the placed resource. That range is not
+        // backed in this process, so the layer's write faults. Back the page it lands in, then forward unchanged:
+        // the call shape itself is ordinary (probed: self is the proxy, a1 is not).
+        if (trace_enabled())
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 70 out=0x%llx back_fn=%d\n",
+                         static_cast<unsigned long long>(a7), back_range_slot() ? 1 : 0);
+        if (a7 && back_range_slot()) {
+            constexpr std::uint64_t page = 0x10000;
+            back_range_slot()(static_cast<std::uint64_t>(a7) & ~(page - 1), page);
+        }
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t);
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8);
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),

@@ -10050,6 +10050,9 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     return hand_out(heap, riid, out);
 }
 
+extern "C" void leonida_register_console_heap(void* fn);
+extern "C" void leonida_register_console_back(void* fn);
+
 // Hand the console descriptor-heap entry point to the device proxy (runtime/shims/d3d12_xs_device.cpp). It cannot
 // look the symbol up by name because nothing exports it from gta6rt.exe.
 extern "C" void leonida_register_console_heap(void* fn);
@@ -10057,6 +10060,7 @@ namespace {
 struct ConsoleHeapRegistration {
     ConsoleHeapRegistration() {
         leonida_register_console_heap(reinterpret_cast<void*>(&create_console_descriptor_heap));
+        leonida_register_console_back(reinterpret_cast<void*>(&console_heap_back));
     }
 } g_console_heap_registration;
 }  // namespace
