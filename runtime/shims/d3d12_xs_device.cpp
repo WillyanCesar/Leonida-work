@@ -992,8 +992,15 @@ inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2
                      static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
 }
 
+// The retail 1.0.2.1 executable asks device slot 73 for this console command-list IID. The PC SDK does not declare
+// it, so without this the PC CreateCommandList returns E_NOINTERFACE and the title asserts on a null list.
+// {c3827890-4024-474c-98cf-645b51dc4874}
+inline constexpr GUID kConsoleGraphicsCommandListIid{
+    0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+
 inline bool is_list_iid(const IID& iid) {
-    return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
+    return IsEqualIID(iid, kConsoleGraphicsCommandListIid) ||
+           IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
            IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) ||
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList1)) ||
@@ -1027,6 +1034,12 @@ inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
+    // The console command-list IID has no PC counterpart, so the wrapped PC list never answers it: this proxy does.
+    if (IsEqualIID(*riid, kConsoleGraphicsCommandListIid)) {
+        *out = self;
+        list_add_ref(self);
+        return S_OK;
+    }
     if (!is_list_iid(*riid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
@@ -1451,8 +1464,10 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
+    // Ask the PC runtime for the base list interface, which it always implements, and let the console-ABI proxy answer
+    // the IID the title asked for. A PC IID goes through unchanged.
+    const IID pc_iid = IsEqualIID(*riid, kConsoleGraphicsCommandListIid) ? __uuidof(ID3D12GraphicsCommandList) : *riid;
+    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, pc_iid, &created);
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
@@ -1877,19 +1892,22 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 26) {
         // GetCustomHeapProperties returns D3D12_HEAP_PROPERTIES by value. The retail executable passes the hidden
-        // return buffer in RCX, which this thunk receives as `self`, and the device in RDX (`a1`); a PC member takes
-        // the device in RCX and the buffer in RDX. Forwarding that verbatim reads a vtable out of the title's buffer
-        // and faults at +0xd0. A PC-order call keeps the device in RCX, so `a1` is not a proxy and goes below.
-        // docs/retail_boot_chain.md section 3.1.
+        // return buffer in RCX, which this thunk receives as `self`, and the device proxy in RDX (`a1`); a PC member
+        // takes the device in RCX and the buffer in RDX. docs/retail_boot_chain.md section 3.1.
+        //
+        // The PC method must be called as a member: calling its vtable entry directly with (buffer, real, ...) hands
+        // it the buffer as `this` and the device object as the return buffer, so it writes the structure over the
+        // device's first words and every later virtual call on that device faults. Copy its result instead.
         if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
             auto* device = reinterpret_cast<DeviceProxy*>(a1);
-            if (device->real_vtable && device->real) {
+            if (device->real && device->real_vtable) {
                 if (trace_enabled())
                     std::fprintf(stderr, "[rt] d3d12_xs: device slot 26 (GetCustomHeapProperties): console order\n");
-                using StructReturnFn = void(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
-                reinterpret_cast<StructReturnFn>(device->real_vtable[Slot])(
-                    reinterpret_cast<void*>(self), device->real, a2, a3);
-                return hr_to_u64(static_cast<std::uint64_t>(S_OK));
+                const D3D12_HEAP_PROPERTIES properties = device->real->GetCustomHeapProperties(
+                    static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3)));
+                std::memcpy(reinterpret_cast<void*>(self), &properties, sizeof(properties));
+                // The console convention returns the buffer's address in RAX; the caller reads its result there.
+                return reinterpret_cast<std::uint64_t>(self);
             }
         }
     } else if constexpr (Slot == 76) {
@@ -1919,8 +1937,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
         }
         if (Slot == routes.queue_x) {
-            log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+            log_xbox_route_once(Slot, "CreateCommandQueueX (PC desc from the 16-byte prefix, Flags masked)", a1, a2,
+                                a3, a4, a5);
+            // The console description starts with a PC D3D12_COMMAND_QUEUE_DESC and continues with Xbox words
+            // (docs/retail_boot_chain.md section 3.2). The PC method reads exactly those 16 bytes, so copy the prefix
+            // and mask Flags to the one bit the host accepts: the console carries bits the Vulkan layer refuses,
+            // which is what "CreateCommandQueue refused (type, priority, flags or node mask), type 2" reports.
+            D3D12_COMMAND_QUEUE_DESC pc_desc{};
+            if (a1) std::memcpy(&pc_desc, reinterpret_cast<const void*>(a1), sizeof(pc_desc));
+            pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
+                static_cast<std::uint32_t>(pc_desc.Flags) &
+                static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT));
+            return hr_to_u64(proxy_create_command_queue(self, a1 ? &pc_desc : nullptr,
                                                         reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
         }
