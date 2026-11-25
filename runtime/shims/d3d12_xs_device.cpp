@@ -152,6 +152,32 @@ bool trace_enabled() {
     return enabled;
 }
 
+const char* slot_name(unsigned slot);
+// XS_TRACE=2 turns on log_forwarded_args below. XS_TRACE=1 is the existing per-slot first-call line.
+bool forwarded_args_enabled() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD length = GetEnvironmentVariableA("XS_TRACE", value, sizeof(value));
+        return length > 0 && value[0] == '2';
+    }();
+    return enabled;
+}
+
+// XS_TRACE=2 adds the raw 64-bit arguments of every forwarded device slot. A console call shape that differs
+// from the PC one faults inside the PC runtime, with this proxy on the stack; the arguments it was handed are
+// the whole diagnosis (docs/retail_boot_chain.md stop 7 calls device slot 26, and the PC runtime faults inside
+// it). Only the values are printed, as addresses: nothing is dereferenced.
+void log_forwarded_args(unsigned slot, const std::uint64_t* words, unsigned count) {
+    std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) forwarded args:", slot, slot_name(slot));
+    for (unsigned i = 0; i < 14; ++i) {
+        if (i < count)
+            std::fprintf(stderr, " a%u=0x%llx", i + 1, static_cast<unsigned long long>(words[i]));
+        else
+            std::fprintf(stderr, " a%u=-", i + 1);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 const char* slot_name(unsigned slot) {
     switch (slot) {
         case 0: return "QueryInterface";
@@ -1999,6 +2025,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
+        // The forwarded call is where a console call shape that differs from the PC one faults, inside the PC
+        // runtime and with this proxy on the stack. Record what it was handed before the call (XS_TRACE=2).
+        if (forwarded_args_enabled()) {
+            const std::uint64_t words[14] = {a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14};
+            log_forwarded_args(Slot, words, 14);
+        }
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
         return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     }
